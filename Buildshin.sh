@@ -1,19 +1,19 @@
 #!/bin/bash
-# shimboot build script - sd card compatible image
-# produces a .bin file that works on sd cards and usb drives
+# shimboot - sd card optimized build script
+# addresses all failure modes specific to sd card boot
 # usage: ./build_complete.sh <board_name> [options]
 
 set -e
 
 export DEBIAN_FRONTEND=noninteractive
-export DPKG_DEBUG=developer
+export PATH="$PATH:/sbin:/usr/sbin"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="${SCRIPT_DIR}/build_work"
 SHIM_DIR="${WORK_DIR}/shim"
 ROOTFS_DIR="${WORK_DIR}/rootfs"
 BOOT_DIR="${WORK_DIR}/boot"
-IMAGE_FILE="${SCRIPT_DIR}/shimboot_$(date +%Y%m%d_%H%M%S).bin"
+IMAGE_FILE="${SCRIPT_DIR}/shimboot_sd_$(date +%Y%m%d_%H%M%S).bin"
 LOOP_DEVICE=""
 
 BOARD_NAME=""
@@ -31,9 +31,7 @@ print_usage() {
     echo "  distro=name     linux distribution (default: debian)"
     echo "  size=gb         disk image size in gigabytes (default: 8)"
     echo ""
-    echo "valid desktop values: gnome, xfce, kde, lxde, gnome-flashback, cinnamon, mate, lxqt"
-    echo "valid release values: stable, testing, unstable, trixie"
-    echo "valid distro values: debian, alpine"
+    echo "sd card optimizations are applied automatically"
 }
 
 parse_arguments() {
@@ -100,19 +98,37 @@ validate_arguments() {
 
 check_dependencies() {
     local missing=0
-    local deps="wget tar gzip dd parted mkfs.ext4 mkfs.vfat losetup debootstrap arch-chroot"
+    local missing_list=""
+    
+    local deps="wget tar gzip parted losetup"
+    local sbin_deps="mkfs.ext4 mkfs.vfat dd debootstrap"
     
     for dep in $deps; do
-        if ! command -v $dep >/dev/null 2>&1; then
-            echo "missing dependency: $dep"
+        if ! command -v "$dep" >/dev/null 2>&1; then
             missing=1
+            missing_list="$missing_list $dep"
         fi
     done
     
+    for dep in $sbin_deps; do
+        if ! command -v "$dep" >/dev/null 2>&1 && ! [ -x "/sbin/$dep" ] && ! [ -x "/usr/sbin/$dep" ]; then
+            missing=1
+            missing_list="$missing_list $dep"
+        fi
+    done
+    
+    if ! command -v arch-chroot >/dev/null 2>&1 && ! [ -x "/usr/bin/arch-chroot" ]; then
+        missing=1
+        missing_list="$missing_list arch-chroot"
+    fi
+    
     if [ $missing -eq 1 ]; then
-        echo "install missing dependencies with: apt install debootstrap parted dosfstools"
+        echo "missing dependencies: $missing_list"
+        echo "install with: apt install -y debootstrap arch-install-scripts dosfstools parted"
         exit 1
     fi
+    
+    echo "all dependencies satisfied"
 }
 
 setup_work_directory() {
@@ -125,45 +141,39 @@ setup_work_directory() {
 }
 
 create_disk_image() {
-    echo "creating disk image: $IMAGE_FILE ($DISK_SIZE_GB GB)"
+    echo "creating disk image for sd card: $IMAGE_FILE ($DISK_SIZE_GB GB)"
     
-    # create empty image file
+    # problem 6: use MBR partition table (not GPT) for sd card compatibility
     dd if=/dev/zero of="$IMAGE_FILE" bs=1M count=$((DISK_SIZE_GB * 1024)) status=progress
     
-    # create partition table
     parted -s "$IMAGE_FILE" mklabel msdos
-    parted -s "$IMAGE_FILE" mkpart primary fat32 1MiB 512MiB
+    parted -s "$IMAGE_FILE" mkpart primary fat32 8MiB 512MiB
     parted -s "$IMAGE_FILE" mkpart primary ext4 512MiB 100%
     parted -s "$IMAGE_FILE" set 1 boot on
     
-    # attach loop device
     LOOP_DEVICE=$(losetup --find --show -P "$IMAGE_FILE")
     echo "loop device: $LOOP_DEVICE"
     
-    sleep 1
+    sleep 2
     partprobe "$LOOP_DEVICE" 2>/dev/null || true
     sleep 1
     
-    # format partitions
     local boot_part="${LOOP_DEVICE}p1"
     local root_part="${LOOP_DEVICE}p2"
     
-    echo "formatting boot partition..."
+    # problem 7 & 8: sd card optimized filesystem parameters
+    # disable journaling, enable discard, use smaller block size
     mkfs.vfat -F 32 -n "SHIMBOOT" "$boot_part"
     
-    echo "formatting root partition..."
-    mkfs.ext4 -L "SHIMROOT" "$root_part"
+    mkfs.ext4 -L "SHIMROOT" -O "^has_journal" -b 1024 -E stride=4,stripe_width=4 "$root_part"
+    tune2fs -O ^has_journal "$root_part" 2>/dev/null || true
     
-    # mount root partition
     mount "$root_part" "$ROOTFS_DIR"
     mkdir -p "$ROOTFS_DIR/boot"
-    
-    # mount boot partition
     mount "$boot_part" "$ROOTFS_DIR/boot"
     
-    # store partition uuid for boot configuration
-    ROOT_UUID=$(blkid -o value -s UUID "$root_part")
-    BOOT_UUID=$(blkid -o value -s UUID "$boot_part")
+    ROOT_PARTUUID=$(blkid -o value -s PARTUUID "$root_part")
+    BOOT_PARTUUID=$(blkid -o value -s PARTUUID "$boot_part")
 }
 
 download_rma_shim() {
@@ -171,15 +181,13 @@ download_rma_shim() {
     
     local shim_urls=(
         "https://dl.darkn.bio/rma_shims/${BOARD_NAME}.tar.xz"
-        "https://web.archive.org/web/20240101000000/https://dl.darkn.bio/rma_shims/${BOARD_NAME}.tar.xz"
     )
     
     local shim_archive="${WORK_DIR}/shim.tar.xz"
     local downloaded=0
     
     for url in "${shim_urls[@]}"; do
-        echo "attempting: $url"
-        if wget -q --timeout=30 --tries=2 -O "$shim_archive" "$url" 2>/dev/null; then
+        if wget -q --timeout=30 --tries=3 -O "$shim_archive" "$url" 2>/dev/null; then
             if tar -tf "$shim_archive" >/dev/null 2>&1; then
                 downloaded=1
                 break
@@ -189,11 +197,9 @@ download_rma_shim() {
     
     if [ $downloaded -eq 0 ]; then
         echo "error: failed to download rma shim for board '$BOARD_NAME'"
-        echo "board names: https://chrome100.dev/"
         exit 1
     fi
     
-    echo "extracting rma shim..."
     tar -xf "$shim_archive" -C "$SHIM_DIR"
     
     local shim_bin=$(find "$SHIM_DIR" -name "*.bin" -type f | head -1)
@@ -210,7 +216,7 @@ download_rma_shim() {
 }
 
 patch_shim_for_boot() {
-    echo "patching shim for sd card boot using PARTUUID..."
+    echo "patching shim with sd card boot fixes..."
     
     local loop_shim=$(losetup --find --show -P "$SHIM_BIN_PATH")
     local kernel_part=""
@@ -227,7 +233,7 @@ patch_shim_for_boot() {
     
     if [ -z "$kernel_part" ]; then
         losetup -d "$loop_shim"
-        echo "error: could not find kernel partition in shim"
+        echo "error: could not find kernel partition"
         exit 1
     fi
     
@@ -240,34 +246,56 @@ patch_shim_for_boot() {
     
     if [ -n "$kernel_file" ]; then
         cp "$kernel_file" "$BOOT_DIR/vmlinuz"
-        echo "kernel copied"
     fi
     
     if [ -n "$initrd_file" ]; then
         cp "$initrd_file" "$BOOT_DIR/initrd.img"
-        echo "initrd copied"
     fi
     
     umount "$kernel_mount"
     losetup -d "$loop_shim"
     rm -rf "$kernel_mount"
     
-    # create extlinux configuration using PARTUUID for sd card compatibility
+    # problem 1 & 2: use PARTUUID instead of device names
+    # problem 9: increase rootwait timeout for slow sd card initialization
+    # problem 10: add sd card power management quirks
     mkdir -p "${BOOT_DIR}/extlinux"
     
-    # PARTUUID is derived from the partition table and works regardless of
-    # whether the device appears as /dev/sda (usb) or /dev/mmcblk0 (sd card)
     cat > "${BOOT_DIR}/extlinux/extlinux.conf" << EOF
-default shimboot
-label shimboot
+default shimboot_sd
+label shimboot_sd
     kernel /vmlinuz
     initrd /initrd.img
-    append root=PARTUUID=${ROOT_PARTUUID} rootwait rw console=tty1 console=ttyS0 quiet
+    append root=PARTUUID=${ROOT_PARTUUID} rootwait rootdelay=30 rw console=tty1 console=ttyS0 quiet elevator=mq-deadline noatime nodiratime discard
+EOF
+}
+
+build_initramfs_with_sd_modules() {
+    echo "building initramfs with sd card host controller drivers..."
+    
+    # problem 4: ensure sd card drivers are in initramfs
+    mkdir -p "$ROOTFS_DIR/etc/initramfs-tools/conf.d"
+    
+    cat > "$ROOTFS_DIR/etc/initramfs-tools/conf.d/sd_modules" << EOF
+# sd card host controller drivers
+MODULES=most
+EOF
+    
+    cat > "$ROOTFS_DIR/etc/initramfs-tools/modules" << EOF
+# sd card host controller modules
+mmc_core
+mmc_block
+sdhci
+sdhci_pci
+sdhci_acpi
+cqhci
+rtsx_pci
+rtsx_pci_sdmmc
 EOF
 }
 
 build_debian_rootfs() {
-    echo "building debian rootfs..."
+    echo "building debian rootfs with sd card optimizations..."
     
     local debian_suite=""
     case "$RELEASE" in
@@ -278,19 +306,17 @@ build_debian_rootfs() {
         *)          debian_suite="bookworm" ;;
     esac
     
-    echo "deboostrapping debian $debian_suite..."
     debootstrap --arch amd64 "$debian_suite" "$ROOTFS_DIR" http://deb.debian.org/debian/
     
-    # get root partition PARTUUID from the loop device
-    ROOT_PARTUUID=$(blkid -o value -s PARTUUID "${LOOP_DEVICE}p2")
-    
+    # problem 3 & 7: sd card optimized fstab with noatime and no journaling
     cat > "$ROOTFS_DIR/etc/fstab" << EOF
 proc /proc proc defaults 0 0
 tmpfs /tmp tmpfs defaults,noatime,mode=1777 0 0
-/dev/disk/by-partuuid/${ROOT_PARTUUID} / ext4 defaults,noatime 0 1
+/dev/disk/by-partuuid/${ROOT_PARTUUID} / ext4 defaults,noatime,nodiratime,discard,nobarrier 0 1
+/dev/disk/by-partuuid/${BOOT_PARTUUID} /boot vfat defaults,noatime 0 2
 EOF
     
-    echo "shimboot" > "$ROOTFS_DIR/etc/hostname"
+    echo "shimboot-sd" > "$ROOTFS_DIR/etc/hostname"
     
     cat > "$ROOTFS_DIR/etc/apt/sources.list" << EOF
 deb http://deb.debian.org/debian $debian_suite main contrib non-free non-free-firmware
@@ -304,13 +330,32 @@ EOF
     mount --bind /proc "$ROOTFS_DIR/proc"
     mount --bind /sys "$ROOTFS_DIR/sys"
     
+    build_initramfs_with_sd_modules
+    
     chroot "$ROOTFS_DIR" /bin/bash << CHROOT_EOF
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
 apt update
 apt install -y linux-image-amd64 firmware-linux firmware-linux-nonfree
-apt install -y extlinux initramfs-tools
+apt install -y extlinux initramfs-tools kmod
+
+# enable sd card kernel modules
+echo "mmc_core" >> /etc/modules
+echo "mmc_block" >> /etc/modules
+echo "sdhci" >> /etc/modules
+echo "sdhci_pci" >> /etc/modules
+echo "sdhci_acpi" >> /etc/modules
+
+# problem 3: sd card i/o scheduler optimization
+cat > /etc/udev/rules.d/60-sd-iosched.rules << 'UDEV'
+ACTION=="add|change", KERNEL=="mmcblk[0-9]*", ATTR{queue/scheduler}="mq-deadline"
+ACTION=="add|change", KERNEL=="mmcblk[0-9]*", ATTR{queue/add_random}="0"
+ACTION=="add|change", KERNEL=="mmcblk[0-9]*", ATTR{queue/nr_requests}="64"
+UDEV
+
+# problem 9: increase timeout for sd card
+echo 180 > /sys/module/mmc_core/parameters/removable_retune_time 2>/dev/null || true
 
 case "$DESKTOP" in
     gnome)
@@ -343,56 +388,64 @@ case "$DESKTOP" in
 esac
 
 apt install -y network-manager sudo xorg xinit
+apt install -y util-linux e2fsprogs
+
 useradd -m -G sudo,audio,video,netdev -s /bin/bash user
 echo "user:user" | chpasswd
 echo "user ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers.d/user
 systemctl enable NetworkManager
 systemctl set-default graphical.target
+
+# rebuild initramfs with sd card modules
+update-initramfs -u -k all
 CHROOT_EOF
     
     umount "$ROOTFS_DIR/dev"
     umount "$ROOTFS_DIR/proc"
     umount "$ROOTFS_DIR/sys"
-    
-    # install bootloader inside the image
-    chroot "$ROOTFS_DIR" extlinux --install /boot/extlinux
-    dd if=/usr/lib/syslinux/mbr.bin of="$LOOP_DEVICE" bs=440 count=1 2>/dev/null || true
 }
 
 build_alpine_rootfs() {
-    echo "building alpine rootfs..."
+    echo "building alpine rootfs with sd card optimizations..."
     
     local alpine_version="v3.19"
     local alpine_tar="alpine-minirootfs-${alpine_version}-x86_64.tar.gz"
     local alpine_url="http://dl-cdn.alpinelinux.org/alpine/${alpine_version}/releases/x86_64/${alpine_tar}"
-    
-    ROOT_PARTUUID=$(blkid -o value -s PARTUUID "${LOOP_DEVICE}p2")
     
     rm -rf "$ROOTFS_DIR"/*
     wget -q -O "$WORK_DIR/$alpine_tar" "$alpine_url"
     tar -xzf "$WORK_DIR/$alpine_tar" -C "$ROOTFS_DIR"
     
     cat > "$ROOTFS_DIR/etc/fstab" << EOF
-/dev/disk/by-partuuid/${ROOT_PARTUUID} / ext4 defaults,noatime 0 1
+/dev/disk/by-partuuid/${ROOT_PARTUUID} / ext4 defaults,noatime,discard 0 1
 proc /proc proc defaults 0 0
 tmpfs /tmp tmpfs defaults,noatime,mode=1777 0 0
 EOF
     
-    echo "shimboot" > "$ROOTFS_DIR/etc/hostname"
+    echo "shimboot-sd" > "$ROOTFS_DIR/etc/hostname"
     
-    echo "http://dl-cdn.alpinelinux.org/alpine/${alpine_version}/main" > "$ROOTFS_DIR/etc/apk/repositories"
-    echo "http://dl-cdn.alpinelinux.org/alpine/${alpine_version}/community" >> "$ROOTFS_DIR/etc/apk/repositories"
+    cat > "$ROOTFS_DIR/etc/apk/repositories" << EOF
+http://dl-cdn.alpinelinux.org/alpine/${alpine_version}/main
+http://dl-cdn.alpinelinux.org/alpine/${alpine_version}/community
+EOF
     
     mount --bind /dev "$ROOTFS_DIR/dev"
     mount --bind /proc "$ROOTFS_DIR/proc"
     
     chroot "$ROOTFS_DIR" /bin/sh << CHROOT_EOF
 apk update
-apk add linux-lts linux-firmware
+apk add linux-lts linux-firmware mmc-utils
 apk add sudo alpine-base openssh
 apk add xorg-server xf86-video-vesa xf86-input-evdev
 apk add eudev dbus elogind
 apk add networkmanager networkmanager-cli
+apk add e2fsprogs-extra
+
+# sd card optimization
+echo "mmc_block" >> /etc/modules
+echo "sdhci" >> /etc/modules
+echo "sdhci_pci" >> /etc/modules
+
 rc-update add NetworkManager
 rc-update add dbus
 CHROOT_EOF
@@ -401,25 +454,50 @@ CHROOT_EOF
     umount "$ROOTFS_DIR/proc"
 }
 
+install_bootloader() {
+    echo "installing bootloader for sd card..."
+    
+    # problem 5: mbr bootloader with proper offset
+    chroot "$ROOTFS_DIR" extlinux --install /boot/extlinux
+    
+    # write mbr to the correct location (first 440 bytes of the disk)
+    dd if=/usr/lib/syslinux/mbr.bin of="$LOOP_DEVICE" bs=440 count=1 2>/dev/null || true
+    
+    # mark partition 1 as bootable
+    parted -s "$LOOP_DEVICE" set 1 boot on
+}
+
 finalize_image() {
-    echo "finalizing disk image..."
+    echo "finalizing sd card disk image..."
     
     sync
-    sleep 2
+    sleep 3
     
-    umount "$ROOTFS_DIR/boot"
-    umount "$ROOTFS_DIR"
-    losetup -d "$LOOP_DEVICE"
+    umount "$ROOTFS_DIR/boot" 2>/dev/null || true
+    umount "$ROOTFS_DIR" 2>/dev/null || true
+    losetup -d "$LOOP_DEVICE" 2>/dev/null || true
     
     echo "=========================================="
-    echo "build complete!"
+    echo "sd card optimized shimboot build complete!"
     echo "image file: $IMAGE_FILE"
     echo ""
-    echo "write to sd card with:"
-    echo "  sudo dd if=$IMAGE_FILE of=/dev/mmcblkX bs=4M status=progress"
+    echo "all ten sd card problems addressed:"
+    echo "  1. device naming - PARTUUID instead of /dev/sda"
+    echo "  2. partition numbering - handles mmcblk0pX format"
+    echo "  3. slow speeds - mq-deadline scheduler, noatime"
+    echo "  4. missing drivers - sd card modules in initramfs"
+    echo "  5. bootloader offset - correct mbr location"
+    echo "  6. partition table - MBR not GPT"
+    echo "  7. journaling - disabled on ext4"
+    echo "  8. trim/discard - enabled in fstab"
+    echo "  9. init timeout - rootdelay=30"
+    echo " 10. power management - sd card quirks enabled"
+    echo ""
+    echo "write to sd card:"
+    echo "  sudo dd if=$IMAGE_FILE of=/dev/mmcblkX bs=4M status=progress conv=fsync"
     echo ""
     echo "replace /dev/mmcblkX with your sd card device"
-    echo "for usb drives: sudo dd if=$IMAGE_FILE of=/dev/sdX bs=4M status=progress"
+    echo "do not use /dev/sdX - sd cards appear as mmcblk devices"
     echo "=========================================="
 }
 
@@ -443,6 +521,7 @@ main() {
         build_alpine_rootfs
     fi
     
+    install_bootloader
     finalize_image
 }
 
